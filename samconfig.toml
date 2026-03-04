@@ -1,0 +1,22 @@
+# SAM deployment configuration
+# Run `sam deploy --guided` on first deploy to populate account-specific values
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "holosecure"
+resolve_s3 = true
+s3_prefix = "holosecure"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"dev\" AlertEmail=\"\""
+
+[prod.deploy.parameters]
+stack_name = "holosecure-prod"
+resolve_s3 = true
+s3_prefix = "holosecure-prod"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"prod\" AlertEmail=\"\""
