@@ -1,0 +1,45 @@
+# HoloSecure Remediation Policies
+# ────────────────────────────────
+# Controls which automated actions are permitted and under what conditions.
+# These policies are evaluated by the guardrails module before any
+# remediation action executes.
+
+global:
+  dry_run: true                    # Set to false in prod after validation
+  require_approval_above: HIGH     # Actions above this severity need manual approval
+  max_actions_per_minute: 10       # Rate limit to prevent automation storms
+  audit_all_actions: true          # Log every action (including blocked) to SNS
+
+ip_blocking:
+  enabled: true
+  waf_ip_set_name: holosecure-blocklist
+  waf_ip_set_scope: REGIONAL
+  # IPs that must never be blocked (VPN exits, office ranges, etc.)
+  allowlist:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # Maximum number of IPs in the blocklist before alerting
+  max_blocklist_size: 1000
+
+credential_revocation:
+  enabled: true
+  # IAM users that should never have credentials auto-revoked
+  protected_users:
+    - admin-break-glass
+    - ci-deployer
+  # Also attach deny-all policy after revoking keys
+  attach_deny_policy: false
+
+instance_isolation:
+  enabled: true
+  isolation_sg_name: holosecure-isolation
+  # Tag isolated instances for tracking
+  tag_key: HoloSecure:Isolated
+  tag_value: "true"
+
+user_disable:
+  enabled: true
+  deny_policy_name: HoloSecure-EmergencyDenyAll
+  protected_users:
+    - admin-break-glass

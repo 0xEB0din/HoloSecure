@@ -1,0 +1,431 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  HoloSecure — Serverless security monitoring platform.
+  Ingests security events via Kinesis, runs detection logic in Lambda,
+  and triggers auto-remediation workflows with guardrail enforcement.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        EVENT_TABLE: !Ref SecurityEventTable
+        ALERT_TOPIC: !Ref AlertTopic
+        RULES_BUCKET: !Ref RulesBucket
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for security alert notifications
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+  EventRetentionDays:
+    Type: Number
+    Default: 90
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # Kinesis — event ingestion stream
+  # ---------------------------------------------------------------
+  SecurityEventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "holosecure-events-${Environment}"
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 168
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: HoloSecure
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------
+  # DynamoDB — security event store
+  # ---------------------------------------------------------------
+  SecurityEventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "holosecure-events-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: source_ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: severity-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: source-ip-index
+          KeySchema:
+            - AttributeName: source_ip
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: HoloSecure
+
+  # ---------------------------------------------------------------
+  # S3 — detection rules and event archive
+  # ---------------------------------------------------------------
+  RulesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "holosecure-rules-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EventArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "holosecure-archive-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: !Ref EventRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------
+  # SNS — alert delivery
+  # ---------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "holosecure-alerts-${Environment}"
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------
+  # Lambda — event ingestion
+  # ---------------------------------------------------------------
+  IngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "holosecure-ingest-${Environment}"
+      Handler: src/ingestion/handler.lambda_handler
+      Description: Consumes raw security events from Kinesis, normalizes, and routes them
+      MemorySize: 512
+      Timeout: 120
+      Events:
+        KinesisEvent:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt SecurityEventStream.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SecurityEventTable
+        - S3CrudPolicy:
+            BucketName: !Ref EventArchiveBucket
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DetectionFunction
+        - KinesisStreamReadPolicy:
+            StreamName: !Sub "holosecure-events-${Environment}"
+      Tags:
+        Project: HoloSecure
+
+  # ---------------------------------------------------------------
+  # Lambda — detection engine
+  # ---------------------------------------------------------------
+  DetectionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "holosecure-detect-${Environment}"
+      Handler: src/detection/handler.lambda_handler
+      Description: Evaluates security events against detection rules and anomaly baselines
+      MemorySize: 512
+      Timeout: 120
+      Environment:
+        Variables:
+          REMEDIATION_FUNCTION: !Ref RemediationFunction
+          ENRICHMENT_FUNCTION: !Ref EnrichmentFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SecurityEventTable
+        - S3ReadPolicy:
+            BucketName: !Ref RulesBucket
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RemediationFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref EnrichmentFunction
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref AlertTopic
+      Tags:
+        Project: HoloSecure
+
+  # ---------------------------------------------------------------
+  # Lambda — threat enrichment
+  # ---------------------------------------------------------------
+  EnrichmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "holosecure-enrich-${Environment}"
+      Handler: src/enrichment/handler.lambda_handler
+      Description: Enriches security events with threat intel and AWS context
+      MemorySize: 256
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SecurityEventTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - guardduty:GetFindings
+                - guardduty:ListFindings
+                - securityhub:GetFindings
+                - securityhub:BatchImportFindings
+                - ec2:DescribeInstances
+                - ec2:DescribeSecurityGroups
+                - iam:GetUser
+                - iam:ListUserTags
+              Resource: "*"
+      Tags:
+        Project: HoloSecure
+
+  # ---------------------------------------------------------------
+  # Lambda — auto-remediation
+  # ---------------------------------------------------------------
+  RemediationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "holosecure-remediate-${Environment}"
+      Handler: src/remediation/handler.lambda_handler
+      Description: Executes guardrail-gated remediation actions (IP blocks, credential revocation, etc.)
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          DRY_RUN: "true"
+          REQUIRE_APPROVAL_ABOVE: CRITICAL
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SecurityEventTable
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref AlertTopic
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:AuthorizeSecurityGroupIngress
+                - ec2:RevokeSecurityGroupIngress
+                - ec2:CreateNetworkAclEntry
+                - ec2:ReplaceNetworkAclEntry
+                - ec2:ModifyInstanceAttribute
+                - iam:PutUserPolicy
+                - iam:DeleteAccessKey
+                - iam:UpdateAccessKey
+                - wafv2:UpdateIPSet
+                - wafv2:GetIPSet
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  "aws:RequestedRegion": !Ref "AWS::Region"
+      Tags:
+        Project: HoloSecure
+
+  # ---------------------------------------------------------------
+  # Lambda — alerting
+  # ---------------------------------------------------------------
+  AlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "holosecure-alert-${Environment}"
+      Handler: src/alerting/handler.lambda_handler
+      Description: Formats and dispatches security alerts via SNS
+      MemorySize: 128
+      Timeout: 30
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref AlertTopic
+        - DynamoDBReadPolicy:
+            TableName: !Ref SecurityEventTable
+      Tags:
+        Project: HoloSecure
+
+  # ---------------------------------------------------------------
+  # CloudWatch — dashboard and alarms
+  # ---------------------------------------------------------------
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "HoloSecure-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Events Ingested",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IngestionFunction}", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Detections Triggered",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DetectionFunction}", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Remediations Executed",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${RemediationFunction}", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IngestionFunction}", {"stat": "Sum", "period": 300}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DetectionFunction}", {"stat": "Sum", "period": 300}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${RemediationFunction}", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+  IngestionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "HoloSecure-IngestionErrors-${Environment}"
+      AlarmDescription: Fires when the ingestion function error rate exceeds threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestionFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+  DetectionLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "HoloSecure-DetectionLatency-${Environment}"
+      AlarmDescription: Fires when detection latency exceeds acceptable threshold
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DetectionFunction
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Outputs:
+  SecurityEventStreamArn:
+    Description: ARN of the Kinesis security event stream
+    Value: !GetAtt SecurityEventStream.Arn
+  SecurityEventTableName:
+    Description: DynamoDB table for security events
+    Value: !Ref SecurityEventTable
+  AlertTopicArn:
+    Description: SNS topic for security alerts
+    Value: !Ref AlertTopic
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=HoloSecure-${Environment}"

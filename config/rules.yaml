@@ -1,0 +1,58 @@
+# HoloSecure Detection Rules Configuration
+# ──────────────────────────────────────────
+# This file supplements the built-in Python rules with declarative YAML
+# definitions. Useful for ops teams that need to add detection logic
+# without redeploying the Lambda functions.
+#
+# Rules defined here are loaded from S3 at cold-start and can be
+# hot-reloaded via the detection engine's reload endpoint.
+
+rules:
+
+  - id: HOLO-Y01
+    name: S3 Bucket Deletion
+    description: Detects deletion of S3 buckets, which may indicate sabotage or cleanup after exfiltration
+    enabled: true
+    severity: HIGH
+    conditions:
+      source: cloudtrail
+      event_type: DeleteBucket
+    actions:
+      - revoke_credentials
+
+  - id: HOLO-Y02
+    name: KMS Key Deletion Scheduled
+    description: Detects scheduling of KMS key deletion — can lead to permanent data loss
+    enabled: true
+    severity: CRITICAL
+    conditions:
+      source: cloudtrail
+      event_type: ScheduleKeyDeletion
+    actions:
+      - revoke_credentials
+      - disable_user
+
+  - id: HOLO-Y03
+    name: EC2 Instance Launched in Unusual Region
+    description: Flags EC2 RunInstances calls in regions not on the approved list
+    enabled: true
+    severity: MEDIUM
+    conditions:
+      source: cloudtrail
+      event_type: RunInstances
+      region_not_in:
+        - us-east-1
+        - us-west-2
+        - eu-west-1
+    actions: []
+
+  - id: HOLO-Y04
+    name: RDS Snapshot Made Public
+    description: Detects when an RDS snapshot is shared publicly
+    enabled: true
+    severity: HIGH
+    conditions:
+      source: cloudtrail
+      event_type: ModifyDBSnapshotAttribute
+    actions:
+      - revoke_credentials
